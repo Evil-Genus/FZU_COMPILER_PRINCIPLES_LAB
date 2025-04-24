@@ -1,0 +1,159 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"app/lexer"
+	"app/utils/log"
+	"app/utils/mmap"
+)
+
+func main() {
+	// Lexer
+	files, err := GetDirFiles("tests/lexer")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(log.Sprintf(
+		log.Argument{Highlight: true, Format: "Lexer Test\n", Args: []any{}},
+		log.Argument{Highlight: true, Format: "Got ", Args: []any{}},
+		log.Argument{FrontColor: log.Magenta, Highlight: true, Format: "%d ", Args: []any{len(files)}},
+		log.Argument{Highlight: true, Format: "Files\n", Args: []any{}},
+		Divider(),
+	))
+
+	for _, file := range files {
+		fmt.Print(log.Sprintf(
+			log.Argument{FrontColor: log.Green, Highlight: true, Format: "+ %s\n", Args: []any{file.path}},
+		))
+	}
+
+	fmt.Print(log.Sprintf(
+		Divider(),
+	))
+
+	// Create result directory if it doesn't exist
+	err = os.MkdirAll("tests/lexer/result", os.ModePerm)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Print(log.Sprintf(
+		log.Argument{FrontColor: log.Red, Highlight: true, Format: "Starting tests...\n", Args: []any{}},
+		Divider(),
+	))
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(files))
+	for _, file := range files {
+		go func(file FileInfo) {
+			st := time.Now()
+			defer wg.Done()
+			result, err := os.Create("tests/lexer/result/" + file.info.Name() + ".result")
+			if err != nil {
+				panic(err)
+			}
+			defer func(result *os.File) {
+				err := result.Close()
+				if err != nil {
+					panic(err)
+				}
+			}(result)
+			err = LexerTest(file.path, result)
+			if err != nil {
+				fmt.Println(
+					log.Sprintf(log.Argument{FrontColor: log.Red, Highlight: true, Format: "System Error: %s", Args: []any{err.Error()}}),
+				)
+			}
+
+			fmt.Println(
+				log.Sprintf(log.Argument{FrontColor: log.Green, Highlight: true, Format: "Test for %s finished, consume %d ms", Args: []any{file.path, time.Since(st).Milliseconds()}}),
+			)
+		}(file)
+	}
+	wg.Wait()
+
+	fmt.Println(log.Sprintf(
+		Divider(),
+		log.Argument{FrontColor: log.Green, Highlight: true, Format: "All tests finished", Args: []any{}},
+	))
+}
+
+type FileInfo struct {
+	info os.FileInfo
+	path string
+}
+
+func GetDirFiles(dir string) ([]FileInfo, error) {
+	var files []FileInfo
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, FileInfo{info: info, path: filepath.Join(dir, entry.Name())})
+	}
+
+	return files, nil
+}
+
+func Divider() log.Argument {
+	return log.Argument{
+		Highlight: true,
+		Format:    "====================\n",
+	}
+}
+
+func LexerTest(filename string, writer io.Writer) error {
+	file, err := mmap.NewMMapReader(filename)
+	if err != nil {
+		panic(err)
+	}
+	defer func(file *mmap.Reader) {
+		err := file.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(file)
+	l := lexer.NewLexer(file)
+
+	for {
+		token, err := l.NextToken()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			_, err := fmt.Fprintf(writer, "Error: %s\n", err.Error())
+			if err != nil {
+				return err
+			}
+			return err
+		}
+		if token.Type == lexer.EOF {
+			break
+		}
+		_, err = fmt.Fprintf(writer, "(%s, %s)\n", token.Type.ToString(), token.Val)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintln(writer)
+	if err != nil {
+		return err
+	}
+	return nil
+}
