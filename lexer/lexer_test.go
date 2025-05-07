@@ -32,11 +32,11 @@ func LexerAct(str string) (tokens []lexer.Token, errCount int) {
 		}
 		if err == nil && !Silent {
 			fmt.Printf(
-				"(%s, %s)\n",
+				"(%s, %s, %s)\n",
 				log.Sprintf(log.Argument{FrontColor: log.Green, Format: "%s", Args: []any{token.Type.ToString()}}),
 				log.Sprintf(log.Argument{FrontColor: log.Yellow, Format: "%s", Args: []any{token.Val}}),
+				log.Sprintf(log.Argument{FrontColor: log.Blue, Format: "%s", Args: []any{token.SpecificType().ToString()}}),
 			)
-
 		}
 		tokens = append(tokens, token)
 		if errors.Is(err, io.EOF) {
@@ -79,11 +79,14 @@ func main() {
 -1
 2147483647
 -2147483648
+0x1A2B3C4D
+0X1a2b3c4d
 
 // 浮点数
 0.0
 -0.1
 3.141592653589793
+00.0
 
 // 字符串
 ""
@@ -103,10 +106,13 @@ func main() {
 			{Type: lexer.INTEGER, Val: "2147483647"},
 			{Type: lexer.OPERATOR, Val: "-"},
 			{Type: lexer.INTEGER, Val: "2147483648"},
+			{Type: lexer.INTEGER, Val: "0x1A2B3C4D"},
+			{Type: lexer.INTEGER, Val: "0X1a2b3c4d"},
 			{Type: lexer.FLOAT, Val: "0.0"},
 			{Type: lexer.OPERATOR, Val: "-"},
 			{Type: lexer.FLOAT, Val: "0.1"},
 			{Type: lexer.FLOAT, Val: "3.141592653589793"},
+			{Type: lexer.FLOAT, Val: "0.0"},
 			{Type: lexer.STRING, Val: ""},
 			{Type: lexer.STRING, Val: "Hello, 世界!"},
 			{Type: lexer.STRING, Val: "Escape: \\n \\t \\\""},
@@ -123,32 +129,22 @@ func main() {
 			{Type: lexer.OPERATOR, Val: "/"},
 			{Type: lexer.OPERATOR, Val: "%"},
 			{Type: lexer.OPERATOR, Val: "="},
-			{Type: lexer.OPERATOR, Val: "="},
-			{Type: lexer.OPERATOR, Val: "="},
-			{Type: lexer.OPERATOR, Val: "!"},
-			{Type: lexer.OPERATOR, Val: "="},
+			{Type: lexer.OPERATOR, Val: "=="},
+			{Type: lexer.OPERATOR, Val: "!="},
 			{Type: lexer.OPERATOR, Val: "<"},
-			{Type: lexer.OPERATOR, Val: "<"},
-			{Type: lexer.OPERATOR, Val: "="},
+			{Type: lexer.OPERATOR, Val: "<="},
 			{Type: lexer.OPERATOR, Val: ">"},
-			{Type: lexer.OPERATOR, Val: ">"},
-			{Type: lexer.OPERATOR, Val: "="},
-			{Type: lexer.OPERATOR, Val: "&"},
-			{Type: lexer.OPERATOR, Val: "&"},
-			{Type: lexer.OPERATOR, Val: "|"},
-			{Type: lexer.OPERATOR, Val: "|"},
-			{Type: lexer.OPERATOR, Val: "+"},
-			{Type: lexer.OPERATOR, Val: "+"},
-			{Type: lexer.OPERATOR, Val: "-"},
-			{Type: lexer.OPERATOR, Val: "-"},
+			{Type: lexer.OPERATOR, Val: ">="},
+			{Type: lexer.OPERATOR, Val: "&&"},
+			{Type: lexer.OPERATOR, Val: "||"},
+			{Type: lexer.OPERATOR, Val: "++"},
+			{Type: lexer.OPERATOR, Val: "--"},
 			{Type: lexer.OPERATOR, Val: "!"},
 			{Type: lexer.OPERATOR, Val: "&"},
 			{Type: lexer.OPERATOR, Val: "|"},
 			{Type: lexer.OPERATOR, Val: "^"},
-			{Type: lexer.OPERATOR, Val: "<"},
-			{Type: lexer.OPERATOR, Val: "<"},
-			{Type: lexer.OPERATOR, Val: ">"},
-			{Type: lexer.OPERATOR, Val: ">"},
+			{Type: lexer.OPERATOR, Val: "<<"},
+			{Type: lexer.OPERATOR, Val: ">>"},
 		},
 	},
 	{
@@ -304,14 +300,16 @@ abc@ 123#
 		str: `// 非法数字
 // 非法整数
 123abc
+0XGHI
+0xghi
+0x123.456
+0x
+0X
 // 非法浮点数
 123.456.789
 
 // 不支持的科学计数法
 1e10
-
-// 不支持的十六进制数
-0x1A
 
 // 不支持的八进制数
 0777
@@ -321,11 +319,9 @@ abc@ 123#
 
 // 错误前缀
 001
-00.0
-001.1
 `,
 		expectedTokens: make([]lexer.Token, 0),
-		errorCount:     9,
+		errorCount:     11,
 	},
 	{
 		name: "Multiline String Using Double Quotes",
@@ -378,6 +374,140 @@ Line 2"
 			{Type: lexer.INTEGER, Val: "42"},
 		},
 		raisingErrorAnyWay: true,
+	},
+	{
+		name: "Operator Mixed",
+		str: `// 操作符混合时，应当匹配最长的操作符后，停止此次匹配
+<=> >=< !=> >-< === ====
+`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.OPERATOR, Val: "<="},
+			{Type: lexer.OPERATOR, Val: ">"},
+			{Type: lexer.OPERATOR, Val: ">="},
+			{Type: lexer.OPERATOR, Val: "<"},
+			{Type: lexer.OPERATOR, Val: "!="},
+			{Type: lexer.OPERATOR, Val: ">"},
+			{Type: lexer.OPERATOR, Val: ">"},
+			{Type: lexer.OPERATOR, Val: "-"},
+			{Type: lexer.OPERATOR, Val: "<"},
+			{Type: lexer.OPERATOR, Val: "=="},
+			{Type: lexer.OPERATOR, Val: "="},
+			{Type: lexer.OPERATOR, Val: "=="},
+			{Type: lexer.OPERATOR, Val: "=="},
+		},
+	},
+	{
+		name:           "Empty Input",
+		str:            ``,
+		expectedTokens: []lexer.Token{},
+	},
+	{
+		name: "unicode 4 bit",
+		str: `// unicode 4 bit
+"\u0041"
+"\u0042\u0043"
+"\u0043\u0044\u0045"
+"\u0044\u0045\u0046\u0047"
+"\u0048\u0065\u006C\u006C\u006F\u002c\u0020\u0057\u006F\u0072\u006C\u0064\u0021"
+`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: "\u0041"},
+			{Type: lexer.STRING, Val: "\u0042\u0043"},
+			{Type: lexer.STRING, Val: "\u0043\u0044\u0045"},
+			{Type: lexer.STRING, Val: "\u0044\u0045\u0046\u0047"},
+			{Type: lexer.STRING, Val: "Hello, World!"},
+		},
+	},
+	{
+		name: "unicode 8 bit",
+		str: `// unicode 8 bit
+"\U0001F600"
+"\U0001F601\U0001F602"
+"\U0001F602\U0001F603\U0001F604"
+"\U0001F603\U0001F604\U0001F605\U0001F606"
+"\U0001F604\U0001F605\U0001F606\U0001F607\U0001F608"
+// 你好，世界！
+"\U00004F60\U0000597D\U0000FE50\U00004e16\U0000754c\U0000ff01"
+`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: "\U0001F600"},
+			{Type: lexer.STRING, Val: "\U0001F601\U0001F602"},
+			{Type: lexer.STRING, Val: "\U0001F602\U0001F603\U0001F604"},
+			{Type: lexer.STRING, Val: "\U0001F603\U0001F604\U0001F605\U0001F606"},
+			{Type: lexer.STRING, Val: "\U0001F604\U0001F605\U0001F606\U0001F607\U0001F608"},
+			{Type: lexer.STRING, Val: "\U00004F60\U0000597D\U0000FE50\U00004e16\U0000754c\U0000ff01"},
+		},
+	},
+	{
+		name: "unicode 4 bit with error",
+		str: `// unicode 4 bit with error
+"\u004K"
+"\u003"
+"\u"`,
+		raisingErrorAnyWay: true,
+	},
+	{
+		name: "unicode 8 bit with error",
+		str: `// unicode 8 bit with error
+"\U0001F60"
+"\U0001F60G"
+"\U"`,
+		raisingErrorAnyWay: true,
+	},
+	{
+		name: "mixed unicode",
+		str: `// mixed unicode
+"\u0041abcd\U0001F600efghijklmnop\U0001F601qrstuvwxyz\U0001F602"`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: "\u0041abcd\U0001F600efghijklmnop\U0001F601qrstuvwxyz\U0001F602"},
+		},
+	},
+	{
+		name: "octal 2 bit",
+		str: `// octal 2 bit
+"\001"
+"\002\003"
+"\003\004\005"
+"\004\005\006\007"`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: "\001"},
+			{Type: lexer.STRING, Val: "\002\003"},
+			{Type: lexer.STRING, Val: "\003\004\005"},
+			{Type: lexer.STRING, Val: "\004\005\006\007"},
+		},
+	},
+	{
+		name: "octal 2 bit with error",
+		str: `// octal 2 bit with error
+"\01"
+"\001\002\003\004\005\006\007\010"
+"\0"`,
+		raisingErrorAnyWay: true,
+	},
+	{
+		name: "mixed unicode and octal",
+		str: `// mixed unicode and octal
+"\u0041abcd\001efghijklmnop\U0001F601qrstuvwxyz\003"`,
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: "\u0041abcd\001efghijklmnop\U0001F601qrstuvwxyz\003"},
+		},
+	},
+	{
+		name: "backtick string",
+		str: "`" + `
+// This is a backtick string
+// It can contain any characters, including newlines and quotes
+"Hello, World!"
+// It will ignore escape sequences like \n, \t, and \"
+\n\t\"\a` + "`",
+		expectedTokens: []lexer.Token{
+			{Type: lexer.STRING, Val: `
+// This is a backtick string
+// It can contain any characters, including newlines and quotes
+"Hello, World!"
+// It will ignore escape sequences like \n, \t, and \"
+\n\t\"\a`},
+		},
 	},
 }
 

@@ -6,27 +6,56 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"unicode"
 
+	"app/config"
 	"app/utils"
 )
 
+var _PrintNoBufferReaderOnce = atomic.Bool{}
+
 type Lexer struct {
-	_reader      *bufio.Reader
+	_reader      io.RuneScanner
 	_line, _pos  int64
 	_lineLengths []int64
 }
 
+// NewLexer creates a new Lexer instance with the given io.Reader.
 func NewLexer(r io.Reader) *Lexer {
+	var reader io.RuneScanner
+	if _PrintNoBufferReaderOnce.CompareAndSwap(false, true) {
+		if config.Config.Lexer.UsingNoBufferedReader {
+			println("Lexer: using no buffered reader")
+		} else {
+			println("Lexer: using buffered reader")
+		}
+	}
+	if config.Config.Lexer.UsingNoBufferedReader {
+		reader = bufio.NewReaderSize(r, 16)
+	}
+	reader = bufio.NewReader(r)
 	return &Lexer{
-		_reader:      bufio.NewReader(r),
+		_reader:      reader,
 		_line:        0,
 		_pos:         1,
 		_lineLengths: []int64{},
 	}
 }
 
+// NextToken reads the next token from the input stream and returns it.
 func (l *Lexer) NextToken() (Token, error) {
+	if l._reader == nil {
+		return Token{}, fmt.Errorf("lexer is not initialized")
+	}
+	token, err := l.nextToken()
+	token.parse()
+	return token, err
+}
+
+// nextToken is a helper function that reads the next token from the input stream.
+// It handles whitespace, comments, strings, characters, words, numbers, and operators.
+func (l *Lexer) nextToken() (Token, error) {
 	err := l.skipWhiteSpace()
 	if errors.Is(err, io.EOF) {
 		return Token{Type: EOF}, nil
@@ -74,6 +103,10 @@ func (l *Lexer) NextToken() (Token, error) {
 		return l.ReadChar()
 	}
 
+	if r == '`' {
+		return l.ReadString2()
+	}
+
 	if utils.IsLetter(r) || r == '_' {
 		return l.ReadWord(r)
 	}
@@ -82,8 +115,10 @@ func (l *Lexer) NextToken() (Token, error) {
 		return l.ReadNumber(r)
 	}
 
-	if _Operators.Contains(string(r)) {
-		return Token{Type: OPERATOR, Val: string(r), Line: l._line, Pos: l._pos}, nil
+	if _Operators.ContainsFunc(func(s string) bool {
+		return strings.HasPrefix(s, string(r))
+	}) {
+		return l.ReadOperator(r)
 	}
 
 	if _Delimiters.Contains(string(r)) {
@@ -93,34 +128,25 @@ func (l *Lexer) NextToken() (Token, error) {
 	return Token{}, fmt.Errorf("unknown character: %c, at line %d, pos %d", r, l._line, l._pos)
 }
 
-func (l *Lexer) peekNextRune() rune {
-	r, _, err := l._reader.ReadRune()
-	if err != nil {
-		return 0
-	}
-	l.retract()
-	return r
-}
-
+// nextRune reads the next rune from the input stream and updates the line and position counters.
+// It also handles line breaks and updates the line lengths slice.
 func (l *Lexer) nextRune() (rune, error) {
 	r, _, err := l._reader.ReadRune()
 	if err != nil {
 		return 0, err
 	}
-	if r == '\n' || (r == '\r' && l.peekNextRune() == '\n') {
-		if r == '\r' {
-			_, _ = l.nextRune() // Consume the '\n' after '\r'
-		}
+	if r == '\n' {
 		l._line++
 		l._lineLengths = append(l._lineLengths, l._pos)
 		l._pos = 0
-		r = '\n'
 	} else {
 		l._pos++
 	}
 	return r, nil
 }
 
+// retract moves the position back by one rune in the input stream.
+// It updates the line and position counters accordingly.
 func (l *Lexer) retract() {
 	_ = l._reader.UnreadRune()
 	if l._pos > 0 {
@@ -132,6 +158,8 @@ func (l *Lexer) retract() {
 	}
 }
 
+// skipWhiteSpace skips over whitespace characters in the input stream.
+// It continues reading until a non-whitespace character is found or EOF is reached.
 func (l *Lexer) skipWhiteSpace() error {
 	for {
 		r, err := l.nextRune()
@@ -145,6 +173,8 @@ func (l *Lexer) skipWhiteSpace() error {
 	}
 }
 
+// skipAnnotation skips over single-line comments in the input stream.
+// It continues reading until a newline character is found or EOF is reached.
 func (l *Lexer) skipAnnotation() error {
 	for {
 		r, err := l.nextRune()
@@ -157,6 +187,8 @@ func (l *Lexer) skipAnnotation() error {
 	}
 }
 
+// skipAnnotation2 skips over multi-line comments in the input stream.
+// It continues reading until the closing comment sequence "*/" is found or EOF is reached.
 func (l *Lexer) skipAnnotation2() error {
 	for {
 		r1, err := l.nextRune()
@@ -175,9 +207,18 @@ func (l *Lexer) skipAnnotation2() error {
 	}
 }
 
+// ReadString reads a double-quoted string from the input stream.
+// It handles escape sequences, unicode, and octal characters.
 func (l *Lexer) ReadString() (Token, error) {
 	s := ""
 	escape := false
+	u := ""
+	o := ""
+	escapeAsUnicodeUpper := false
+	escapeAsUnicodeLower := false
+	escapeAsOctal := false
+	widthOfUnicode := 0
+	widthOfOctal := 0
 	for {
 		r, err := l.nextRune()
 		if err != nil {
@@ -198,21 +239,65 @@ func (l *Lexer) ReadString() (Token, error) {
 			continue
 		}
 		if escape {
-			switch r {
-			case 'n':
-				s += "\n"
-			case 't':
-				s += "\t"
-			case 'r':
-				s += "\r"
-			case 'b':
-				s += "\b"
-			case 'f':
-				s += "\f"
-			default:
-				s += string(r)
+			if escapeAsUnicodeLower {
+				if !utils.IsHex(r) {
+					return Token{}, fmt.Errorf("illegal hex for unicode[lower] %s, at line %d, pos %d", u, l._line, l._pos)
+				} else {
+					widthOfUnicode++
+					u += string(r)
+					if widthOfUnicode == 4 {
+						s += string(utils.HexToRune(u))
+						u = ""
+						widthOfUnicode = 0
+						escapeAsUnicodeLower = false
+						escape = false
+					}
+				}
+			} else if escapeAsUnicodeUpper {
+				if !utils.IsHex(r) {
+					return Token{}, fmt.Errorf("illegal hex for unicode[upper] %s, at line %d, pos %d", u, l._line, l._pos)
+				} else {
+					widthOfUnicode++
+					u += string(r)
+					if widthOfUnicode == 8 {
+						s += string(utils.HexToRune(u))
+						u = ""
+						widthOfUnicode = 0
+						escapeAsUnicodeUpper = false
+						escape = false
+					}
+				}
+			} else if escapeAsOctal {
+				if !utils.IsOctal(r) {
+					return Token{}, fmt.Errorf("illegal octal %s, at line %d, pos %d", o, l._line, l._pos)
+				} else {
+					widthOfOctal++
+					o += string(r)
+					if widthOfOctal == 2 {
+						s += string(utils.OctalToRune(o))
+						o = ""
+						widthOfOctal = 0
+						escapeAsOctal = false
+						escape = false
+					}
+				}
+			} else {
+				switch r {
+				case 'n', 't', 'r', 'b', 'f', 'a', 'v', '"':
+					s += utils.AppendEscape(r)
+				case 'u': // escape unicode
+					escapeAsUnicodeLower = true
+				case 'U': // escape unicode
+					escapeAsUnicodeUpper = true
+				case '0': // escape octal
+					escapeAsOctal = true
+				default:
+					return Token{}, fmt.Errorf("illegal escape \\%s, at line %d, pos %d", string(r), l._line, l._pos)
+				}
 			}
-			escape = false
+			if !escapeAsUnicodeLower && !escapeAsUnicodeUpper && !escapeAsOctal {
+				escape = false
+			}
 			continue
 		}
 		if r == '\n' {
@@ -224,12 +309,46 @@ func (l *Lexer) ReadString() (Token, error) {
 		}
 		s += string(r)
 	}
-	return Token{Type: STRING, Val: s, Line: l._line, Pos: l._pos}, nil
+	if escapeAsUnicodeLower {
+		return Token{}, fmt.Errorf("illegal unicode[lower] %s, at line %d, pos %d", u, l._line, l._pos)
+	}
+	if escapeAsUnicodeUpper {
+		return Token{}, fmt.Errorf("illegal unicode[upper] %s, at line %d, pos %d", u, l._line, l._pos)
+	}
+	if escapeAsOctal {
+		return Token{}, fmt.Errorf("illegal octal %s, at line %d, pos %d", o, l._line, l._pos)
+	}
+	return Token{Type: STRING, Val: s, Line: l._line, Pos: l._pos, _type: ConstantStringDoubleQuote}, nil
 }
 
+// ReadString2 reads a backtick-quoted string from the input stream.
+func (l *Lexer) ReadString2() (Token, error) {
+	s := ""
+	for {
+		r, err := l.nextRune()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return Token{Type: EOF}, fmt.Errorf("string not closed, line %d, pos %d", l._line, l._pos)
+			} else {
+				return Token{}, err
+			}
+		}
+		if r == '`' {
+			break
+		}
+		s += string(r)
+	}
+	return Token{Type: STRING, Val: s, Line: l._line, Pos: l._pos, _type: ConstantStringBacktick}, nil
+}
+
+// ReadChar reads a single-quoted character from the input stream.
+// It handles escape sequences, unicode, and octal characters.
 func (l *Lexer) ReadChar() (Token, error) {
 	s := ""
 	escape := false
+	escapeAsUnicodeUpper := false
+	escapeAsUnicodeLower := false
+	illegalUnicode := false
 	width := 0
 	for {
 		r, err := l.nextRune()
@@ -253,17 +372,24 @@ func (l *Lexer) ReadChar() (Token, error) {
 		}
 		if escape {
 			switch r {
-			case 'n':
-				s += "\n"
-			case 't':
-				s += "\t"
-			case 'r':
-				s += "\r"
-			case 'b':
-				s += "\b"
-			case 'f':
-				s += "\f"
+			case 'n', 't', 'r', 'b', 'f', 'a', 'v':
+				s += utils.AppendEscape(r)
+			case 'u': // escapeAsUnicode
+				if escapeAsUnicodeLower || escapeAsUnicodeUpper {
+					illegalUnicode = true
+				}
+				escapeAsUnicodeLower = true
+				s += string(r)
+			case 'U': // escapeAsUnicode
+				if escapeAsUnicodeLower || escapeAsUnicodeUpper {
+					illegalUnicode = true
+				}
+				escapeAsUnicodeUpper = true
+				s += string(r)
 			default:
+				if (escapeAsUnicodeLower || escapeAsUnicodeUpper) && !utils.IsHex(r) {
+					illegalUnicode = true
+				}
 				s += string(r)
 			}
 			width++
@@ -273,12 +399,30 @@ func (l *Lexer) ReadChar() (Token, error) {
 		s += string(r)
 		width++
 	}
-	if width > 1 {
+	// check if the char is valid[not starting with \ and too long]
+	if width > 1 && (!escapeAsUnicodeLower && !escapeAsUnicodeUpper) {
 		return Token{}, fmt.Errorf("illegal char[too long] %s, at line %d, pos %d", s, l._line, l._pos)
+	}
+	if escapeAsUnicodeLower {
+		if width != 5 {
+			return Token{}, fmt.Errorf("illegal char[unmatched unicode length] %s, at line %d, pos %d", s, l._line, l._pos)
+		}
+		return Token{Type: CHAR, Val: string(utils.HexToRune(s[1:])), Line: l._line, Pos: l._pos}, nil
+	}
+	if escapeAsUnicodeUpper {
+		if width != 9 {
+			return Token{}, fmt.Errorf("illegal char[unmatched unicode length] %s, at line %d, pos %d", s, l._line, l._pos)
+		}
+		return Token{Type: CHAR, Val: string(utils.HexToRune(s[1:])), Line: l._line, Pos: l._pos}, nil
+	}
+	if (escapeAsUnicodeLower || escapeAsUnicodeUpper) && illegalUnicode {
+		return Token{}, fmt.Errorf("illegal char[escapeAsUnicode] %s, at line %d, pos %d", s, l._line, l._pos)
 	}
 	return Token{Type: CHAR, Val: s, Line: l._line, Pos: l._pos}, nil
 }
 
+// ReadWord reads a word (identifier or keyword) from the input stream.
+// It handles letters, digits, and underscores.
 func (l *Lexer) ReadWord(r rune) (Token, error) {
 	s := string(r)
 	var errWhenPassed error
@@ -302,6 +446,8 @@ func (l *Lexer) ReadWord(r rune) (Token, error) {
 	}
 }
 
+// ReadNumber reads a number (integer or float) from the input stream.
+// It handles digits, letters, underscores, and hexadecimal numbers.
 func (l *Lexer) ReadNumber(r rune) (Token, error) {
 	s := string(r)
 	illegalSuffix := false
@@ -322,17 +468,36 @@ func (l *Lexer) ReadNumber(r rune) (Token, error) {
 		}
 		s += string(nr)
 	}
-	if illegalSuffix {
+	if illegalSuffix && !strings.HasPrefix(s, "0x") && !strings.HasPrefix(s, "0X") {
 		return tokenWhenWrong, fmt.Errorf("illegal number[suffix] %s, at line %d, pos %d", s, l._line, l._pos)
 	}
 	dotCount := strings.Count(s, ".")
 	if dotCount == 1 {
+		if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+			return tokenWhenWrong, fmt.Errorf("illegal number[hex] %s, at line %d, pos %d", s, l._line, l._pos)
+		}
 		if strings.HasPrefix(s, "00") {
-			return tokenWhenWrong, fmt.Errorf("illegal number[float] %s, at line %d, pos %d", s, l._line, l._pos)
+			parts := strings.Split(s, ".")
+			l := utils.RemoveLeadingZeros(parts[0])
+			if l == "" {
+				l = "0"
+			}
+			s = l + "." + parts[1]
 		}
 		return Token{Type: FLOAT, Val: s, Line: l._line, Pos: l._pos}, errWhenPassed
 	} else if dotCount == 0 {
-		if strings.HasPrefix(s, "0") {
+		if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+			if len(s) < 3 {
+				return tokenWhenWrong, fmt.Errorf("illegal number[hex] %s, at line %d, pos %d", s, l._line, l._pos)
+			}
+			if strings.ContainsFunc(s[2:], func(r rune) bool {
+				return !utils.IsHex(r)
+			}) {
+				return tokenWhenWrong, fmt.Errorf("illegal number[hex] %s, at line %d, pos %d", s, l._line, l._pos)
+			} else {
+				return Token{Type: INTEGER, Val: s, Line: l._line, Pos: l._pos}, errWhenPassed
+			}
+		} else if strings.HasPrefix(s, "0") {
 			if len(s) > 1 {
 				return tokenWhenWrong, fmt.Errorf("illegal number[integer] %s, at line %d, pos %d", s, l._line, l._pos)
 			}
@@ -341,4 +506,54 @@ func (l *Lexer) ReadNumber(r rune) (Token, error) {
 	} else {
 		return tokenWhenWrong, fmt.Errorf("illegal number[too many dots] %s, at line %d, pos %d", s, l._line, l._pos)
 	}
+}
+
+// ReadOperator reads an operator from the input stream.
+// It handles multi-character operators and checks for valid operators.
+func (l *Lexer) ReadOperator(r rune) (Token, error) {
+	prefix := string(r)
+	previousSet := _Operators
+	currentSet := previousSet.Filter(func(s string) bool {
+		return strings.HasPrefix(s, prefix)
+	})
+	bestMatch := ""
+	var errWhenPassed error
+	tokenWhenError := Token{}
+	for {
+		if currentSet.Contains(prefix) {
+			bestMatch = prefix
+		}
+
+		r, err := l.nextRune()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				errWhenPassed = io.EOF
+				tokenWhenError.Type = EOF
+			}
+			l.retract()
+			break
+		}
+		prefix += string(r)
+		currentSet = currentSet.Filter(func(s string) bool {
+			return strings.HasPrefix(s, prefix)
+		})
+
+		if currentSet.Size() == 0 {
+			l.retract()
+			break
+		}
+	}
+
+	if bestMatch == "" {
+		// impossible to reach here
+		return tokenWhenError, fmt.Errorf("illegal operator %s, at line %d, pos %d", prefix, l._line, l._pos)
+	}
+
+	// retract to the best match
+	retractStep := len(prefix) - len(bestMatch)
+	for range retractStep {
+		l.retract()
+	}
+
+	return Token{Type: OPERATOR, Val: bestMatch, Line: l._line, Pos: l._pos}, errWhenPassed
 }
